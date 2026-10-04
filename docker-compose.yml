@@ -1,0 +1,14 @@
+﻿services:
+  backend:
+    build: ./backend
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      DATABASE_PATH: /app/data/officebridge.sqlite
+      STORAGE_PATH: /app/storage
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-10485760}
+      DEFAULT_ROOM_EXPIRATION_MINUTES: ${DEFAULT_ROOM_EXPIRATION_MINUTES:-60}
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
