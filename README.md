@@ -184,6 +184,25 @@ docker compose down
 
 Runtime data in `data/` and `storage/` remains on the host and is not committed.
 
+## Backend images on GHCR
+
+After the backend smoke tests, frontend production build, and Docker build check pass, pushes to `main` publish the backend image to GitHub Container Registry at:
+
+```text
+ghcr.io/h4num4nth4/officebridge
+```
+
+Each published image receives its full Git commit SHA as a traceable version tag, plus `latest` for the most recent successful publication from `main`. Pull either tag with:
+
+```sh
+docker pull ghcr.io/h4num4nth4/officebridge:latest
+docker pull ghcr.io/h4num4nth4/officebridge:COMMIT_SHA
+```
+
+Replace `COMMIT_SHA` with the full Git commit SHA for the version you want.
+
+The workflow uses its built-in `GITHUB_TOKEN` to publish; no personal access token or repository secret is needed. The image includes an OCI source label linking it to this repository. The package's visibility must be checked in the GitHub Packages page under the package's settings; it is not assumed here. Public GHCR packages can be pulled anonymously. Private packages require authentication with an account/token that has package read access. See [GitHub's Container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) for authentication and visibility details.
+
 ## API overview
 
 The REST API is served by the backend. Room-scoped information and file/text operations require a valid room member ID in the `X-User-Id` header, except for joining. Expired rooms are rejected.
