@@ -137,7 +137,7 @@ cp backend/.env.example backend/.env
 | `DEFAULT_ROOM_EXPIRATION_MINUTES` | `60` | Default room lifetime; room creation can specify a duration up to 7 days |
 | `VITE_API_BASE_URL` | empty | Optional frontend API base URL; leave empty for Vite's local `/api` and Socket.IO proxies |
 
-Keep real `.env` files private. `.env.example` contains safe defaults and is intended to be committed. Docker Compose reads interpolation values from the shell or a root `.env`; its `PORT` value controls the host-side port, while the backend container listens on port 3000. The Compose file passes upload-size and default-expiration settings to the backend.
+Keep real `.env` files private. `.env.example` contains safe defaults and is intended to be committed. Standalone backend development uses `PORT` (default `3000`). The Vite development proxy expects the backend at `http://localhost:3000`, so keep that port for the local setup below. In Compose mode the backend listens internally on port 3000 without publishing that port on the host. Compose reads the frontend host port and upload-size and default-expiration settings from the shell or a root `.env`.
 
 ### Running locally
 
@@ -174,7 +174,18 @@ From the project root:
 docker compose up --build
 ```
 
-This builds and starts the **backend only** on host port 3000 by default. SQLite data and uploaded files are persisted through bind mounts to `./data` and `./storage`. Verify the backend at <http://localhost:3000/health>. Start the frontend separately using the Vite steps above; its development proxy expects the backend at `http://localhost:3000`.
+This builds and starts the frontend and backend. Open the application at <http://localhost:8080>. NGINX forwards `/api` and `/socket.io` internally to the backend at `backend:3000` on the Compose network. The backend port is not published to the host, so its health endpoint is not directly available at <http://localhost:3000/health> in Compose mode. To check it from inside the backend container, run `docker compose exec backend node -e "fetch('http://127.0.0.1:3000/health').then(r => r.text()).then(console.log)"`.
+
+SQLite data and uploaded files remain persisted through the existing bind mounts to `./data` and `./storage`. The frontend uses same-origin API and Socket.IO requests, so no `VITE_API_BASE_URL` is needed in the image.
+
+To use a different frontend host port, set `FRONTEND_PORT` (default `8080`) before running Compose. For example, in PowerShell:
+
+```powershell
+$env:FRONTEND_PORT = "8081"
+docker compose up --build
+```
+
+The Compose services use HTTP; HTTPS/TLS is not configured.
 
 To stop the service, press `Ctrl+C`, then run:
 

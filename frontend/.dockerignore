@@ -1,0 +1,13 @@
+node_modules
+dist
+build
+coverage
+.git
+.env
+.env.*
+*.log
+npm-debug.log*
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
