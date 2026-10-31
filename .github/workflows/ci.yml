@@ -173,6 +173,268 @@ jobs:
       - name: Build frontend image
         run: docker build -t officebridge-frontend:ci ./frontend
 
+      - name: Set up Node.js 24 for Compose integration tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      - name: Test Docker Compose integration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          run_suffix="$(node -p "require('node:crypto').randomBytes(6).toString('hex')")"
+          project="officebridge-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${run_suffix}"
+          test_root="$(mktemp -d "${RUNNER_TEMP}/${project}.XXXXXX")"
+          override_file="${test_root}/compose.override.yml"
+          compose=(docker compose --project-name "$project" --file docker-compose.yml --file "$override_file")
+          compose_started=false
+
+          cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+
+            if [[ "$compose_started" == true ]]; then
+              if [[ "$status" -ne 0 ]]; then
+                echo "Compose integration test failed; recent service logs:" >&2
+                "${compose[@]}" logs --no-color --tail=100 >&2 || true
+              fi
+              if ! "${compose[@]}" down --volumes --remove-orphans --timeout 30; then
+                echo "Failed to clean up the isolated Compose project ${project}." >&2
+                if [[ "$status" -eq 0 ]]; then status=1; fi
+              fi
+            fi
+
+            if ! rm -rf -- "$test_root"; then
+              echo "Failed to remove temporary test directory ${test_root}." >&2
+              if [[ "$status" -eq 0 ]]; then status=1; fi
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          cat > "$override_file" <<'COMPOSE'
+          services:
+            frontend:
+              image: officebridge-frontend:ci
+            backend:
+              image: officebridge-backend:ci
+              volumes:
+                - integration-data:/app/data
+                - integration-storage:/app/storage
+          volumes:
+            integration-data: {}
+            integration-storage: {}
+          COMPOSE
+
+          FRONTEND_PORT="$(node -e '
+            const net = require("node:net");
+            const probe = net.createServer();
+            probe.once("error", (error) => {
+              console.error(`Unable to bind a temporary frontend port: ${error.message}`);
+              process.exitCode = 1;
+            });
+            probe.listen(0, "0.0.0.0", () => {
+              const port = probe.address().port;
+              probe.close((error) => {
+                if (error) {
+                  console.error(`Unable to release the temporary frontend port: ${error.message}`);
+                  process.exitCode = 1;
+                } else {
+                  console.log(port);
+                }
+              });
+            });
+          ')"
+          if [[ ! "$FRONTEND_PORT" =~ ^[0-9]+$ ]]; then
+            echo "Could not select an available frontend host port." >&2
+            exit 1
+          fi
+          export FRONTEND_PORT
+          export TEST_PROJECT="$project"
+
+          if [[ -n "$(docker ps --all --quiet --filter "label=com.docker.compose.project=${project}")" || \
+            -n "$(docker network ls --quiet --filter "label=com.docker.compose.project=${project}")" || \
+            -n "$(docker volume ls --quiet --filter "label=com.docker.compose.project=${project}")" ]]; then
+            echo "Compose project resources already exist for ${project}; refusing to reuse them." >&2
+            exit 1
+          fi
+
+          if ! docker image inspect officebridge-backend:ci >/dev/null || \
+            ! docker image inspect officebridge-frontend:ci >/dev/null; then
+            echo "Expected prebuilt CI images are unavailable; refusing to build or pull replacements." >&2
+            exit 1
+          fi
+
+          resolved_config="$("${compose[@]}" config --format json)"
+          printf '%s' "$resolved_config" | node -e '
+            const assert = require("node:assert/strict");
+            const fs = require("node:fs");
+            const config = JSON.parse(fs.readFileSync(0, "utf8"));
+            const services = config.services ?? {};
+            assert.deepEqual(Object.keys(services).sort(), ["backend", "frontend"]);
+            assert.equal(services.backend.image, "officebridge-backend:ci");
+            assert.equal(services.frontend.image, "officebridge-frontend:ci");
+
+            const mounts = services.backend.volumes ?? [];
+            assert.equal(mounts.length, 2, "backend must have exactly two isolated storage mounts");
+            assert.ok(mounts.every((mount) => mount.type === "volume"), "backend mounts must be named volumes, never bind mounts");
+            assert.deepEqual(
+              mounts.map((mount) => mount.target).sort(),
+              ["/app/data", "/app/storage"],
+            );
+            const declaredVolumes = config.volumes ?? {};
+            assert.deepEqual(Object.keys(declaredVolumes).sort(), ["integration-data", "integration-storage"]);
+            for (const logicalName of ["integration-data", "integration-storage"]) {
+              assert.ok(declaredVolumes[logicalName], `missing isolated volume ${logicalName}`);
+              assert.notEqual(declaredVolumes[logicalName].external, true, `${logicalName} must be created for this project`);
+              const resolvedName = declaredVolumes[logicalName].name ?? `${process.env.TEST_PROJECT}_${logicalName}`;
+              const target = logicalName === "integration-data" ? "/app/data" : "/app/storage";
+              const mount = mounts.find((candidate) => candidate.target === target);
+              assert.ok(
+                [logicalName, resolvedName].includes(mount.source),
+                `backend target ${target} is not mounted on declared isolated volume ${logicalName}`,
+              );
+            }
+            assert.equal((services.backend.ports ?? []).length, 0, "backend must not publish a host port");
+
+            const ports = services.frontend.ports ?? [];
+            assert.equal(ports.length, 1, "frontend must have exactly one host port mapping");
+            assert.equal(String(ports[0].published), process.env.FRONTEND_PORT);
+            assert.equal(Number(ports[0].target), 80);
+            console.log("Compose isolation preflight passed: CI images, isolated volumes, and selected frontend port.");
+          '
+
+          compose_started=true
+          if ! "${compose[@]}" up --detach --no-build --pull never; then
+            echo "Compose could not start the isolated stack or bind frontend port ${FRONTEND_PORT}." >&2
+            exit 1
+          fi
+
+          OFFICEBRIDGE_BASE_URL="http://127.0.0.1:${FRONTEND_PORT}" node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+
+          const baseUrl = process.env.OFFICEBRIDGE_BASE_URL;
+          if (!baseUrl) throw new Error('OFFICEBRIDGE_BASE_URL is required');
+
+          const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+          async function pollFrontend() {
+            const deadline = Date.now() + 60_000;
+            let lastResult = 'no response received';
+
+            while (Date.now() < deadline) {
+              try {
+                const response = await fetch(`${baseUrl}/`, { signal: AbortSignal.timeout(3_000) });
+                const html = await response.text();
+                if (response.status === 200) {
+                  assert.match(html, /id=["']root["']/, 'frontend response should contain the SPA root element');
+                  console.log('PASS frontend SPA responds with HTTP 200');
+                  return;
+                }
+                lastResult = `HTTP ${response.status}`;
+              } catch (error) {
+                lastResult = error.message;
+              }
+              await pause(1_000);
+            }
+
+            throw new Error(`Frontend did not become available within 60 seconds (${lastResult})`);
+          }
+
+          async function expectJson(path, expectedStatus, options = {}) {
+            const response = await fetch(new URL(path, baseUrl), {
+              ...options,
+              signal: AbortSignal.timeout(15_000),
+            });
+            const body = await response.text();
+            assert.equal(
+              response.status,
+              expectedStatus,
+              `${options.method ?? 'GET'} ${path}: expected HTTP ${expectedStatus}, got ${response.status}; body: ${body.slice(0, 500)}`,
+            );
+            return { response, body, json: body ? JSON.parse(body) : undefined };
+          }
+
+          const jsonHeaders = { 'content-type': 'application/json' };
+          await pollFrontend();
+
+          const created = await expectJson('/api/rooms', 201, {
+            method: 'POST',
+            headers: jsonHeaders,
+            body: JSON.stringify({ name: 'Compose integration room', displayName: 'CI owner', expirationMinutes: 60 }),
+          });
+          const roomCode = created.json?.room?.code;
+          const ownerId = created.json?.user?.id;
+          assert.ok(roomCode, 'room creation response must include room.code');
+          assert.ok(ownerId, 'room creation response must include user.id');
+          console.log('PASS room creation through frontend proxy');
+
+          const joined = await expectJson(`/api/rooms/${encodeURIComponent(roomCode)}/join`, 201, {
+            method: 'POST',
+            headers: jsonHeaders,
+            body: JSON.stringify({ displayName: 'CI guest' }),
+          });
+          const guestId = joined.json?.user?.id;
+          assert.ok(guestId, 'join response must include user.id');
+          const memberRoom = await expectJson(`/api/rooms/${encodeURIComponent(roomCode)}`, 200, {
+            headers: { 'X-User-Id': guestId },
+          });
+          assert.ok(memberRoom.json?.members?.some((member) => member.id === ownerId));
+          assert.ok(memberRoom.json?.members?.some((member) => member.id === guestId));
+          console.log('PASS second participant joins and authenticated room lookup');
+
+          const ownerHeaders = { 'X-User-Id': ownerId };
+          const textContent = 'OfficeBridge Compose integration text';
+          const shared = await expectJson(`/api/rooms/${encodeURIComponent(roomCode)}/texts`, 201, {
+            method: 'POST',
+            headers: { ...jsonHeaders, ...ownerHeaders },
+            body: JSON.stringify({ content: textContent, language: 'text' }),
+          });
+          assert.equal(shared.json?.text?.content, textContent);
+          const listedTexts = await expectJson(`/api/rooms/${encodeURIComponent(roomCode)}/texts`, 200, {
+            headers: ownerHeaders,
+          });
+          assert.ok(listedTexts.json?.texts?.some((text) => text.id === shared.json.text.id));
+          console.log('PASS authenticated shared text create and retrieval');
+
+          const fileContent = 'OfficeBridge Compose integration file';
+          const form = new FormData();
+          form.append('file', new Blob([fileContent], { type: 'text/plain' }), 'compose-integration.txt');
+          const uploadResponse = await fetch(new URL(`/api/rooms/${encodeURIComponent(roomCode)}/files`, baseUrl), {
+            method: 'POST',
+            headers: ownerHeaders,
+            body: form,
+            signal: AbortSignal.timeout(15_000),
+          });
+          const uploadBody = await uploadResponse.text();
+          assert.equal(uploadResponse.status, 201, `file upload: expected HTTP 201, got ${uploadResponse.status}; body: ${uploadBody.slice(0, 500)}`);
+          const uploaded = JSON.parse(uploadBody);
+          const fileId = uploaded?.file?.id;
+          assert.ok(fileId, 'file upload response must include file.id');
+
+          const downloaded = await fetch(new URL(`/api/rooms/${encodeURIComponent(roomCode)}/files/${encodeURIComponent(fileId)}`, baseUrl), {
+            headers: ownerHeaders,
+            signal: AbortSignal.timeout(15_000),
+          });
+          assert.equal(downloaded.status, 200, `file download expected HTTP 200, got ${downloaded.status}`);
+          assert.equal(await downloaded.text(), fileContent, 'downloaded file content must match the upload');
+
+          const deleted = await fetch(new URL(`/api/rooms/${encodeURIComponent(roomCode)}/files/${encodeURIComponent(fileId)}`, baseUrl), {
+            method: 'DELETE',
+            headers: ownerHeaders,
+            signal: AbortSignal.timeout(15_000),
+          });
+          assert.equal(deleted.status, 204, `file delete expected HTTP 204, got ${deleted.status}`);
+          const finalFiles = await expectJson(`/api/rooms/${encodeURIComponent(roomCode)}/files`, 200, {
+            headers: ownerHeaders,
+          });
+          assert.ok(Array.isArray(finalFiles.json?.files), 'file listing response must include files');
+          assert.equal(finalFiles.json?.files?.some((file) => file.id === fileId), false);
+          console.log('PASS authenticated file upload, matching download, deletion, and final listing');
+          NODE
+
       - name: Scan backend image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
