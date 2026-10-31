@@ -8,5 +8,7 @@ COPY src ./src
 RUN mkdir -p /app/data /app/storage && chown node:node /app/data /app/storage
 USER node
 ENV PORT=3000
+ENV DATABASE_PATH=/app/data/officebridge.sqlite
+ENV STORAGE_PATH=/app/storage
 EXPOSE 3000
 CMD ["node", "src/server.js"]
