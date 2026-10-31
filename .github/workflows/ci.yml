@@ -178,6 +178,9 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install backend dependencies for Socket.IO client
+        run: npm ci --prefix backend
+
       - name: Test Docker Compose integration
         shell: bash
         run: |
@@ -367,9 +370,42 @@ jobs:
           });
           const roomCode = created.json?.room?.code;
           const ownerId = created.json?.user?.id;
+          const ownerDisplayName = created.json?.user?.displayName;
           assert.ok(roomCode, 'room creation response must include room.code');
           assert.ok(ownerId, 'room creation response must include user.id');
+          assert.ok(ownerDisplayName, 'room creation response must include user.displayName');
           console.log('PASS room creation through frontend proxy');
+
+          const { createRequire } = await import('node:module');
+          const require = createRequire(`${process.cwd()}/backend/package.json`);
+          const { io: createSocket } = require('socket.io-client');
+          const ownerSocket = createSocket(baseUrl, {
+            auth: { roomCode, userId: ownerId },
+            autoConnect: false,
+            transports: ['websocket'],
+            reconnection: false,
+            timeout: 10_000,
+          });
+          try {
+            const presence = await new Promise((resolve, reject) => {
+              const timeout = setTimeout(() => reject(new Error('Timed out waiting for users:present')), 10_000);
+              ownerSocket.once('users:present', (payload) => {
+                clearTimeout(timeout);
+                resolve(payload);
+              });
+              ownerSocket.once('connect_error', (error) => {
+                clearTimeout(timeout);
+                reject(error);
+              });
+              ownerSocket.connect();
+            });
+            assert.equal(ownerSocket.connected, true, 'Socket.IO client should connect');
+            assert.equal(ownerSocket.io.engine.transport.name, 'websocket', 'Socket.IO must use WebSocket transport');
+            assert.deepEqual(presence, { users: [{ id: ownerId, displayName: ownerDisplayName }] });
+            console.log('PASS Socket.IO WebSocket connection through NGINX and users:present payload');
+          } finally {
+            ownerSocket.disconnect();
+          }
 
           const joined = await expectJson(`/api/rooms/${encodeURIComponent(roomCode)}/join`, 201, {
             method: 'POST',
