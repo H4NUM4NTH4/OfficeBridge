@@ -74,6 +74,102 @@ jobs:
       - name: Build backend image
         run: docker build -t officebridge-backend:ci ./backend
 
+      - name: Smoke-test backend image
+        shell: bash
+        env:
+          TEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -Eeuo pipefail
+
+          container="officebridge-backend-smoke-${TEST_ID}"
+          data_volume="${container}-data"
+          storage_volume="${container}-storage"
+          container_created=false
+          data_volume_created=false
+          storage_volume_created=false
+
+          cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+
+            if [[ "$container_created" == true ]]; then
+              docker container rm --force "$container" >/dev/null || status=1
+            fi
+            if [[ "$storage_volume_created" == true ]]; then
+              docker volume rm "$storage_volume" >/dev/null || status=1
+            fi
+            if [[ "$data_volume_created" == true ]]; then
+              docker volume rm "$data_volume" >/dev/null || status=1
+            fi
+
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          if docker container inspect "$container" >/dev/null 2>&1 || \
+            docker volume inspect "$data_volume" >/dev/null 2>&1 || \
+            docker volume inspect "$storage_volume" >/dev/null 2>&1; then
+            echo "A disposable smoke-test resource already exists for ${TEST_ID}." >&2
+            exit 1
+          fi
+
+          docker image inspect officebridge-backend:ci >/dev/null
+          docker volume create "$data_volume" >/dev/null
+          data_volume_created=true
+          docker volume create "$storage_volume" >/dev/null
+          storage_volume_created=true
+          docker create --name "$container" --network none \
+            --mount "type=volume,source=${data_volume},target=/app/data" \
+            --mount "type=volume,source=${storage_volume},target=/app/storage" \
+            officebridge-backend:ci >/dev/null
+          container_created=true
+          docker start "$container" >/dev/null
+
+          configured_user="$(docker inspect --format '{{.Config.User}}' "$container")"
+          if [[ "$configured_user" != "node" ]]; then
+            echo "Expected container user node, got: $configured_user" >&2
+            docker logs "$container" >&2 || true
+            exit 1
+          fi
+
+          runtime_identity="$(docker exec "$container" node -e 'console.log(`${process.env.DATABASE_PATH}|${process.env.STORAGE_PATH}|${process.getuid()}`)')"
+          IFS='|' read -r database_path storage_path runtime_uid <<< "$runtime_identity"
+          if [[ "$database_path" != "/app/data/officebridge.sqlite" || \
+            "$storage_path" != "/app/storage" || ! "$runtime_uid" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Unexpected runtime defaults or UID: $runtime_identity" >&2
+            docker logs "$container" >&2 || true
+            exit 1
+          fi
+
+          ready=false
+          for attempt in {1..30}; do
+            if ! container_running="$(docker inspect --format '{{.State.Running}}' "$container" 2>&1)"; then
+              echo "Unable to inspect backend container before /health check." >&2
+              echo "$container_running" >&2
+              docker logs "$container" >&2 || true
+              exit 1
+            fi
+
+            if [[ "$container_running" != "true" ]]; then
+              echo "Backend container stopped before /health became ready." >&2
+              docker logs "$container" >&2 || true
+              exit 1
+            fi
+
+            if docker exec "$container" node -e "fetch('http://127.0.0.1:3000/health').then(response => process.exit(response.status === 200 ? 0 : 1)).catch(() => process.exit(1))"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$ready" != true ]]; then
+            echo "Backend image did not return HTTP 200 from /health." >&2
+            docker logs "$container" >&2 || true
+            exit 1
+          fi
+
       - name: Build frontend image
         run: docker build -t officebridge-frontend:ci ./frontend
 
