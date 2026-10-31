@@ -173,6 +173,11 @@ jobs:
       - name: Build frontend image
         run: docker build -t officebridge-frontend:ci ./frontend
 
+      - name: Validate NGINX configuration
+        run: >-
+          docker run --rm --network none --add-host backend:127.0.0.1
+          --entrypoint nginx officebridge-frontend:ci -t
+
       - name: Set up Node.js 24 for Compose integration tests
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
